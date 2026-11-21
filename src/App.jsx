@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from "react";
+import { Html5Qrcode } from "html5-qrcode";
 
 const API = "http://localhost:8080/api";
 
@@ -26,6 +27,19 @@ function playSuccessChime(enabled) {
     });
   } catch {
     // Ignore audio context restrictions
+  }
+}
+
+function speakText(text, enabled) {
+  if (!enabled || !window.speechSynthesis) return;
+  try {
+    window.speechSynthesis.cancel();
+    const clean = text.replace(/[*_#`]/g, "");
+    const utterance = new SpeechSynthesisUtterance(clean);
+    utterance.rate = 1.05;
+    window.speechSynthesis.speak(utterance);
+  } catch {
+    // Ignore speech synthesis issues
   }
 }
 
@@ -96,12 +110,16 @@ export default function App() {
   const [mobileTab, setMobileTab] = useState("chat");
   const [activeReceipt, setActiveReceipt] = useState(null);
   const [toastMsg, setToastMsg] = useState("");
+  const [isListening, setIsListening] = useState(false);
+  const [showScanner, setShowScanner] = useState(false);
 
   const confettiRef = useRef(null);
   const messagesEndRef = useRef(null);
   const textareaRef = useRef(null);
   const knownStatusesRef = useRef(new Map());
   const toastTimerRef = useRef(null);
+  const recognitionRef = useRef(null);
+  const qrScannerRef = useRef(null);
 
   const showToast = useCallback((msg) => {
     setToastMsg(msg);
@@ -184,10 +202,12 @@ export default function App() {
         });
         if (!res.ok) throw new Error("Server error");
         const data = await res.json();
+        const replyText = data.reply || "Done.";
         setMessages((prev) => [
           ...prev,
-          { id: crypto.randomUUID(), role: "bot", text: data.reply || "Done.", time: formatTime() }
+          { id: crypto.randomUUID(), role: "bot", text: replyText, time: formatTime() }
         ]);
+        speakText(replyText, soundEnabled);
         await fetchPayments();
       } catch {
         setMessages((prev) => [
@@ -223,6 +243,160 @@ export default function App() {
     setInput(e.target.value);
     e.target.style.height = "auto";
     e.target.style.height = `${Math.min(e.target.scrollHeight, 110)}px`;
+  };
+
+  const handleVoiceToggle = () => {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      showToast("Voice recognition not supported in this browser");
+      return;
+    }
+
+    if (isListening) {
+      recognitionRef.current?.stop();
+      setIsListening(false);
+      return;
+    }
+
+    try {
+      const recognition = new SpeechRecognition();
+      recognitionRef.current = recognition;
+      recognition.lang = "en-KE";
+      recognition.continuous = false;
+      recognition.interimResults = true;
+
+      recognition.onstart = () => {
+        setIsListening(true);
+        showToast("🎙️ Listening... Say your M-Pesa request");
+      };
+
+      recognition.onresult = (e) => {
+        const transcript = Array.from(e.results)
+          .map((r) => r[0].transcript)
+          .join("");
+        setInput(transcript);
+        if (textareaRef.current) {
+          textareaRef.current.style.height = "auto";
+          textareaRef.current.style.height = `${Math.min(textareaRef.current.scrollHeight, 110)}px`;
+        }
+      };
+
+      recognition.onerror = (e) => {
+        setIsListening(false);
+        showToast(`Mic notice: ${e.error || "ended"}`);
+      };
+
+      recognition.onend = () => {
+        setIsListening(false);
+      };
+
+      recognition.start();
+    } catch {
+      setIsListening(false);
+      showToast("Unable to start microphone");
+    }
+  };
+
+  const handleQrSuccess = useCallback(
+    (decodedText) => {
+      if (qrScannerRef.current) {
+        try {
+          qrScannerRef.current.stop().then(() => {
+            qrScannerRef.current?.clear();
+          }).catch(() => {});
+        } catch {}
+      }
+      setShowScanner(false);
+
+      let prompt = "";
+      try {
+        const parsed = JSON.parse(decodedText);
+        if (parsed.till) {
+          prompt = `Pay KES ${parsed.amount || 300} to Till ${parsed.till}`;
+        } else if (parsed.paybill) {
+          prompt = `Pay KES ${parsed.amount || 500} to Paybill ${parsed.paybill} ${parsed.account ? `acc ${parsed.account}` : ""}`;
+        } else if (parsed.phone) {
+          prompt = `Request KES ${parsed.amount || 200} from ${parsed.phone}`;
+        }
+      } catch {
+        const trimmed = decodedText.trim();
+        if (/^(07|01|254)\d{8,9}$/.test(trimmed)) {
+          prompt = `Request KES 500 from ${trimmed}`;
+        } else if (trimmed.toLowerCase().includes("till")) {
+          prompt = `Pay KES 350 to ${trimmed}`;
+        } else if (trimmed.toLowerCase().includes("paybill")) {
+          prompt = `Pay KES 1000 to ${trimmed}`;
+        } else {
+          prompt = trimmed.startsWith("Request") || trimmed.startsWith("Pay")
+            ? trimmed
+            : `Request KES 150 from ${trimmed}`;
+        }
+      }
+
+      setInput(prompt);
+      showToast(`Scanned: ${prompt.slice(0, 32)}...`);
+      if (textareaRef.current) {
+        textareaRef.current.focus();
+        textareaRef.current.style.height = "auto";
+        textareaRef.current.style.height = `${Math.min(textareaRef.current.scrollHeight, 110)}px`;
+      }
+    },
+    [showToast]
+  );
+
+  const closeScanner = useCallback(() => {
+    if (qrScannerRef.current) {
+      try {
+        qrScannerRef.current.stop().then(() => {
+          qrScannerRef.current?.clear();
+        }).catch(() => {});
+      } catch {}
+    }
+    setShowScanner(false);
+  }, []);
+
+  useEffect(() => {
+    if (!showScanner) return;
+
+    let scanner = null;
+    const timer = setTimeout(() => {
+      try {
+        scanner = new Html5Qrcode("qr-reader");
+        qrScannerRef.current = scanner;
+        scanner
+          .start(
+            { facingMode: "environment" },
+            { fps: 10, qrbox: { width: 220, height: 220 } },
+            (decodedText) => handleQrSuccess(decodedText),
+            () => {}
+          )
+          .catch((err) => {
+            console.warn("Camera start err:", err);
+          });
+      } catch (err) {
+        console.warn("Scanner init err:", err);
+      }
+    }, 150);
+
+    return () => {
+      clearTimeout(timer);
+      if (qrScannerRef.current) {
+        try {
+          qrScannerRef.current.stop().then(() => {
+            qrScannerRef.current?.clear();
+          }).catch(() => {});
+        } catch {}
+      }
+    };
+  }, [showScanner, handleQrSuccess]);
+
+  const handleFileUpload = (e) => {
+    const file = e.target.files?.[0];
+    if (!file || !qrScannerRef.current) return;
+    qrScannerRef.current
+      .scanFile(file, true)
+      .then((decodedText) => handleQrSuccess(decodedText))
+      .catch(() => showToast("Could not detect QR code in that image"));
   };
 
   const handleDemoMode = async () => {
@@ -414,6 +588,12 @@ export default function App() {
               ))}
             </div>
 
+            {isListening && (
+              <div className="listening-banner">
+                <span>🎙️</span> Listening... Speak your M-Pesa request clearly (e.g. &quot;Request 500 from 0712345678&quot;)
+              </div>
+            )}
+
             <form className="input-box" onSubmit={handleFormSubmit}>
               <textarea
                 ref={textareaRef}
@@ -421,8 +601,26 @@ export default function App() {
                 value={input}
                 onChange={handleTextareaChange}
                 onKeyDown={handleInputKeyDown}
-                placeholder="Type 'Request KES 500 from 0712345678 for lunch'..."
+                placeholder={isListening ? "Listening to your voice..." : "Type 'Request KES 500 from 0712345678' or use 🎙️ / 📷"}
               />
+              <div className="input-tools">
+                <button
+                  type="button"
+                  className={`icon-tool-btn ${isListening ? "active-mic" : ""}`}
+                  onClick={handleVoiceToggle}
+                  title={isListening ? "Stop listening" : "Voice command (Speak to request)"}
+                >
+                  {isListening ? "⏹" : "🎙️"}
+                </button>
+                <button
+                  type="button"
+                  className="icon-tool-btn"
+                  onClick={() => setShowScanner(true)}
+                  title="Scan M-Pesa QR / Till Code"
+                >
+                  📷
+                </button>
+              </div>
               <button type="submit" className="send-btn" disabled={inFlight}>
                 Send ↵
               </button>
@@ -588,6 +786,92 @@ export default function App() {
                   📲 Resend STK
                 </button>
                 <button type="button" onClick={() => setActiveReceipt(null)}>Done</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showScanner && (
+        <div
+          className="modal-backdrop"
+          onClick={(e) => {
+            if (e.target.classList.contains("modal-backdrop")) closeScanner();
+          }}
+        >
+          <div className="scanner-modal" role="dialog" aria-modal="true" aria-labelledby="scannerTitle">
+            <div className="receipt-header">
+              <div>
+                <strong id="scannerTitle">📷 M-Pesa QR Scanner</strong>
+                <div className="receipt-sub">Live Camera • Point at an M-Pesa Till, Paybill, or Send Money QR</div>
+              </div>
+              <button
+                type="button"
+                className="close-modal-btn"
+                onClick={closeScanner}
+                aria-label="Close scanner"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="receipt-body">
+              <div className="scanner-viewfinder">
+                <div id="qr-reader" />
+                <div className="scan-laser" />
+              </div>
+
+              <div style={{ marginTop: "12px", display: "flex", gap: "8px", alignItems: "center" }}>
+                <label style={{ fontSize: "0.8rem", color: "var(--text-muted)" }}>
+                  Upload QR image file:
+                </label>
+                <input type="file" accept="image/*" onChange={handleFileUpload} style={{ fontSize: "0.8rem" }} />
+              </div>
+
+              <div className="demo-chips-title">One-Click Demo QRs (For Instant Hackathon Pitching):</div>
+              <div className="demo-qr-grid">
+                <div
+                  className="demo-qr-card"
+                  onClick={() => handleQrSuccess(JSON.stringify({ till: "542910", amount: 450 }))}
+                >
+                  <div>
+                    <strong>☕ Java House Nairobi</strong>
+                    <div style={{ fontSize: "0.72rem", color: "var(--text-muted)" }}>Buy Goods Till 542910</div>
+                  </div>
+                  <span className="badge SUCCESS">KES 450</span>
+                </div>
+
+                <div
+                  className="demo-qr-card"
+                  onClick={() =>
+                    handleQrSuccess(
+                      JSON.stringify({ paybill: "247247", account: "FUEL-102", amount: 2000 })
+                    )
+                  }
+                >
+                  <div>
+                    <strong>⛽ Shell Energies</strong>
+                    <div style={{ fontSize: "0.72rem", color: "var(--text-muted)" }}>Paybill 247247 • Acc FUEL-102</div>
+                  </div>
+                  <span className="badge SUCCESS">KES 2,000</span>
+                </div>
+
+                <div
+                  className="demo-qr-card"
+                  onClick={() => handleQrSuccess(JSON.stringify({ phone: "0712345678", amount: 500 }))}
+                >
+                  <div>
+                    <strong>📱 Direct Send Money</strong>
+                    <div style={{ fontSize: "0.72rem", color: "var(--text-muted)" }}>0712345678</div>
+                  </div>
+                  <span className="badge SUCCESS">KES 500</span>
+                </div>
+              </div>
+
+              <div className="modal-actions" style={{ marginTop: "16px" }}>
+                <button type="button" onClick={closeScanner}>
+                  Close Scanner
+                </button>
               </div>
             </div>
           </div>
